@@ -1,11 +1,20 @@
-import os
 from dotenv import load_dotenv
+import os
+import certifi
+from pymongo import MongoClient
 
-# Load environment variables from .env file
 load_dotenv()
 
-# JWT Secret Key - loaded from environment variable for security
-SECRET_KEY = os.getenv('SECRET_KEY')
+MONGODB_URI = os.getenv('MONGODB_URI')
+DB_NAME = os.getenv('DB_NAME', 'expTracker')
+PORT = int(os.getenv('PORT'))
 
-# MongoDB URI - loaded from environment variable
-MONGO_URI = os.getenv('MONGO_URI')
+_mongo_client = MongoClient(
+    MONGODB_URI,
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=5000
+)
+
+db = _mongo_client[DB_NAME]
+JWT_SECRET = os.getenv('JWT_SECRET')
