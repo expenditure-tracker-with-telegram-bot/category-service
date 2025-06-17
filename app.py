@@ -1,23 +1,15 @@
-import os
 import jwt
-from flask import Flask, request, jsonify
-from flask_restful import Api, Resource
-from pymongo import MongoClient
-from datetime import datetime, timedelta
-from functools import wraps
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from datetime import datetime
+from typing import Optional
+from config import db, PORT, JWT_SECRET
 
-load_dotenv()
+app = FastAPI(title="Category Service")
 
-# ENV VARS
-MONGO_URI = os.getenv("MONGODB_URI")
-PORT = int(os.getenv("PORT", 5003))
-JWT_SECRET = os.getenv("JWT_SECRET")
-
-client = MongoClient(MONGO_URI)
-db = client.get_default_database()
 categories_collection = db.categories
 
+# System categories that are available to all users
 SYSTEM_CATEGORIES = [
     {'name': 'Food',         'type': 'expense', 'system': True},
     {'name': 'Transport',    'type': 'expense', 'system': True},
@@ -29,213 +21,289 @@ SYSTEM_CATEGORIES = [
     {'name': 'Investment',   'type': 'income',  'system': True},
 ]
 
-# Init system categories if not present
+# Initialize system categories
 for cat in SYSTEM_CATEGORIES:
     if not categories_collection.find_one({'name': cat['name'], 'system': True}):
         cat['created_at'] = datetime.utcnow()
         categories_collection.insert_one(cat)
 
-app = Flask(__name__)
-api = Api(app)
+# Pydantic models
+class CategoryCreate(BaseModel):
+    name: str
+    type: str  # 'income' or 'expense'
 
-def verify_jwt_token(token):
+    class Config:
+        schema_extra = {
+            "example": {
+                "name": "Groceries",
+                "type": "expense"
+            }
+        }
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = None
+
+# Authentication functions
+def verify_jwt_token(token: str):
+    """Verify and decode JWT token"""
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
         return payload
     except jwt.ExpiredSignatureError:
-        return None
+        raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
-        return None
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-def get_current_user():
-    user = request.headers.get('X-User')
-    role = request.headers.get('X-Role')
+def get_current_user(request: Request):
+    """Get current user from headers (for gateway forwarded requests)"""
+    # First try to get from gateway headers
+    user = request.headers.get('X-User') or request.headers.get('x-user')
+    role = request.headers.get('X-Role') or request.headers.get('x-role')
+
     if user and role:
         return {'Username': user, 'Role': role}
 
+    # If no gateway headers, try to extract from Authorization header
     auth_header = request.headers.get('Authorization')
     if auth_header and auth_header.startswith('Bearer '):
         token = auth_header.split(' ')[1]
-        payload = verify_jwt_token(token)
-        if payload:
-            return payload
-    return None
+        return verify_jwt_token(token)
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        user = get_current_user()
-        if not user or 'Username' not in user:
-            return jsonify({"error": "Authentication required"}), 401
-        return f(user, *args, **kwargs)
-    return decorated
+    raise HTTPException(status_code=401, detail="Authentication required")
 
-def require_admin(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        user = get_current_user()
-        if not user or user.get('Role') != 'Admin':
-            return jsonify({"error": "Admin access required"}), 403
-        return f(user, *args, **kwargs)
-    return decorated
+def require_admin(request: Request):
+    """Require admin role"""
+    user = get_current_user(request)
+    if user.get('Role') != 'Admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
 
-@app.route("/health")
+@app.get("/health")
 def health():
-    return jsonify({"status": "Category Service running", "port": PORT})
+    return {"status": "Category Service running", "port": PORT}
 
-@app.route("/category", methods=["POST"])
-@require_auth
-def create_category(user):
-    data = request.json
-    name = data.get('name')
-    type_ = data.get('type')
+@app.post("/category")
+def create_category(category: CategoryCreate, request: Request):
+    """Create a new category for the authenticated user"""
+    user = get_current_user(request)
     username = user.get('Username')
 
-    if type_ not in ['income', 'expense']:
-        return jsonify({"error": "Category type must be 'income' or 'expense'"}), 400
+    if not username:
+        raise HTTPException(status_code=401, detail="User not authenticated")
 
+    # Validate category type
+    if category.type not in ['income', 'expense']:
+        raise HTTPException(status_code=400, detail="Category type must be 'income' or 'expense'")
+
+    # Check if category already exists for this user or as system category
     existing = categories_collection.find_one({
-        'name': name,
+        'name': category.name,
         '$or': [{'user': username}, {'system': True}]
     })
 
     if existing:
-        return jsonify({"error": "Category already exists"}), 409
+        raise HTTPException(status_code=409, detail="Category already exists")
 
+    # Create new category
     category_data = {
-        'name': name,
-        'type': type_,
+        'name': category.name,
+        'type': category.type,
         'user': username,
         'system': False,
         'created_at': datetime.utcnow()
     }
+
     result = categories_collection.insert_one(category_data)
 
-    return jsonify({
+    return {
         "message": "Category created successfully",
         "id": str(result.inserted_id),
         "category": {
-            "name": name,
-            "type": type_,
+            "name": category.name,
+            "type": category.type,
             "system": False
         }
-    })
+    }
 
-@app.route("/category", methods=["GET"])
-@require_auth
-def list_categories(user):
+@app.get("/category")
+def list_categories(request: Request):
+    """List all categories available to the authenticated user"""
+    user = get_current_user(request)
     username = user.get('Username')
+
+    if not username:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
+    # Get both user categories and system categories
     categories = list(categories_collection.find({
         '$or': [{'user': username}, {'system': True}]
     }))
+
+    # Format response
     for cat in categories:
         cat['_id'] = str(cat['_id'])
         if 'created_at' in cat:
             cat['created_at'] = cat['created_at'].isoformat()
-    categories.sort(key=lambda x: (not x.get('system', False), x['name']))
-    return jsonify({"categories": categories})
 
-@app.route("/category/<name>", methods=["PUT"])
-@require_auth
-def update_category(user, name):
-    data = request.json
+    # Sort by system categories first, then alphabetically
+    categories.sort(key=lambda x: (not x.get('system', False), x['name']))
+
+    return {"categories": categories}
+
+@app.put("/category/{name}")
+def update_category(name: str, category: CategoryUpdate, request: Request):
+    """Update a user's category (system categories cannot be updated)"""
+    user = get_current_user(request)
     username = user.get('Username')
+
+    if not username:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
+    # Find the category (must be user's category, not system)
     existing = categories_collection.find_one({
         'name': name,
         'user': username,
         'system': False
     })
+
     if not existing:
-        return jsonify({"error": "Category not found or cannot be modified (system categories are read-only)"}), 404
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found or cannot be modified (system categories are read-only)"
+        )
+
+    # Validate new category type if provided
+    if category.type and category.type not in ['income', 'expense']:
+        raise HTTPException(status_code=400, detail="Category type must be 'income' or 'expense'")
 
     update_data = {}
-    new_name = data.get('name')
-    type_ = data.get('type')
-    if type_ and type_ not in ['income', 'expense']:
-        return jsonify({"error": "Category type must be 'income' or 'expense'"}), 400
-    if new_name:
-        conflict = categories_collection.find_one({
-            'name': new_name,
+    if category.name:
+        # Check if new name conflicts with existing categories
+        name_conflict = categories_collection.find_one({
+            'name': category.name,
             '$or': [{'user': username}, {'system': True}],
             '_id': {'$ne': existing['_id']}
         })
-        if conflict:
-            return jsonify({"error": "Category name already exists"}), 409
-        update_data['name'] = new_name
-    if type_:
-        update_data['type'] = type_
+        if name_conflict:
+            raise HTTPException(status_code=409, detail="Category name already exists")
+        update_data['name'] = category.name
+
+    if category.type:
+        update_data['type'] = category.type
+
     update_data['updated_at'] = datetime.utcnow()
+
     categories_collection.update_one(
         {'name': name, 'user': username},
         {'$set': update_data}
     )
-    return jsonify({"message": "Category updated successfully"})
 
-@app.route("/category/<name>", methods=["DELETE"])
-@require_auth
-def delete_category(user, name):
+    return {"message": "Category updated successfully"}
+
+@app.delete("/category/{name}")
+def delete_category(name: str, request: Request):
+    """Delete a user's category (system categories cannot be deleted)"""
+    user = get_current_user(request)
     username = user.get('Username')
+
+    if not username:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
     result = categories_collection.delete_one({
         'name': name,
         'user': username,
         'system': False
     })
-    if result.deleted_count == 0:
-        return jsonify({"error": "Category not found or cannot be deleted (system categories are protected)"}), 404
-    return jsonify({"message": "Category deleted successfully"})
 
-@app.route("/category/stats", methods=["GET"])
-@require_auth
-def category_stats(user):
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found or cannot be deleted (system categories are protected)"
+        )
+
+    return {"message": "Category deleted successfully"}
+
+@app.get("/category/stats")
+def category_stats(request: Request):
+    """Get category statistics for the authenticated user"""
+    user = get_current_user(request)
     username = user.get('Username')
+
+    if not username:
+        raise HTTPException(status_code=401, detail="User not authenticated")
+
     pipeline = [
         {'$match': {'$or': [{'user': username}, {'system': True}]}},
         {'$group': {'_id': '$type', 'count': {'$sum': 1}}}
     ]
+
     stats = list(categories_collection.aggregate(pipeline))
-    formatted_stats = {'income_categories': 0, 'expense_categories': 0, 'total_categories': 0}
+
+    # Format stats
+    formatted_stats = {
+        'income_categories': 0,
+        'expense_categories': 0,
+        'total_categories': 0
+    }
+
     for stat in stats:
         if stat['_id'] == 'income':
             formatted_stats['income_categories'] = stat['count']
         elif stat['_id'] == 'expense':
             formatted_stats['expense_categories'] = stat['count']
         formatted_stats['total_categories'] += stat['count']
-    return jsonify({"stats": formatted_stats})
 
-# ADMIN ENDPOINTS
+    return {"stats": formatted_stats}
 
-@app.route("/admin/categories", methods=["GET"])
-@require_admin
-def admin_all_categories(user):
+# Admin endpoints
+@app.get("/admin/categories")
+def admin_all_categories(request: Request):
+    """Get all categories (admin only)"""
+    require_admin(request)
+
     categories = list(categories_collection.find({}))
+
     for cat in categories:
         cat['_id'] = str(cat['_id'])
         if 'created_at' in cat:
             cat['created_at'] = cat['created_at'].isoformat()
         if 'updated_at' in cat:
             cat['updated_at'] = cat['updated_at'].isoformat()
-    return jsonify({"categories": categories})
 
-@app.route("/admin/categories/stats", methods=["GET"])
-@require_admin
-def admin_category_stats(user):
+    return {"categories": categories}
+
+@app.get("/admin/categories/stats")
+def admin_category_stats(request: Request):
+    """Get detailed category statistics (admin only)"""
+    require_admin(request)
+
     total_categories = categories_collection.count_documents({})
     system_categories = categories_collection.count_documents({'system': True})
     user_categories = categories_collection.count_documents({'system': False})
-    type_pipeline = [{'$group': {'_id': '$type', 'count': {'$sum': 1}}}]
+
+    # Categories by type
+    type_pipeline = [
+        {'$group': {'_id': '$type', 'count': {'$sum': 1}}}
+    ]
     type_stats = list(categories_collection.aggregate(type_pipeline))
+
+    # Recent categories (last 7 days)
+    from datetime import timedelta
     recent_date = datetime.utcnow() - timedelta(days=7)
     recent_categories = categories_collection.count_documents({
         'created_at': {'$gte': recent_date},
         'system': False
     })
-    return jsonify({
+
+    return {
         "total_categories": total_categories,
         "system_categories": system_categories,
         "user_categories": user_categories,
         "recent_categories_7d": recent_categories,
         "categories_by_type": type_stats
-    })
+    }
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
