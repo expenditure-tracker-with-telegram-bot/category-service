@@ -8,5 +8,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 requests
-flask-restful
+bcrypt
+pydantic
 certifi
+redis
