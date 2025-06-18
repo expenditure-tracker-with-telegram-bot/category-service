@@ -1,18 +1,18 @@
-import os
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, Depends
 from pydantic import BaseModel
-from datetime import datetime
-from pymongo import MongoClient
-from config import JWT_SECRET, db, PORT
 
-# Configuration
+from config import db, PORT
+
 app = FastAPI(title="Category Service")
 
 categories_collection = db.categories
 
+
 class CategoryCreate(BaseModel):
     name: str
-    type: str  # 'income' or 'expense'
+    type: str
+
 
 def get_current_user(request: Request) -> dict:
     """Gets user info from trusted headers set by the API Gateway."""
@@ -22,11 +22,13 @@ def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="User identity not found in request")
     return {"username": username, "role": role}
 
+
 def require_admin(user: dict = Depends(get_current_user)):
     """Ensures the user has an Admin role."""
     if user.get("role") != "Admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
 
 # --- User Routes ---
 @app.post("/create")
@@ -44,6 +46,7 @@ def create_category(category: CategoryCreate, user: dict = Depends(get_current_u
     result = categories_collection.insert_one(new_category)
     return {"message": "Category created", "id": str(result.inserted_id)}
 
+
 @app.get("/list")
 def list_categories(user: dict = Depends(get_current_user)):
     username = user.get('username')
@@ -51,6 +54,7 @@ def list_categories(user: dict = Depends(get_current_user)):
     for cat in categories:
         cat['_id'] = str(cat['_id'])
     return {"categories": categories}
+
 
 # --- Admin Routes ---
 @app.get("/admin/all")
