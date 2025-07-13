@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: category-service-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: category-service
+  template:
+    metadata:
+      labels:
+        app: category-service
+    spec:
+      containers:
+      - name: category-service
+        image: pr0meth4us/category-service:latest
+        ports:
+        - containerPort: 5003
+        env:
+        - name: PORT
+          value: "5003"
+        - name: DB_NAME
+          value: "expTracker"
+        - name: MONGODB_URI
+          valueFrom:
+            secretKeyRef:
+              name: my-secrets
+              key: mongodb_uri
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: my-secrets
+              key: jwt_secret
